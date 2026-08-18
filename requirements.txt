@@ -1,0 +1,8 @@
+streamlit
+requests
+beautifulsoup4
+markdownify
+sentence-transformers
+chromadb
+groq
+langchain-text-splitters
