@@ -2,7 +2,7 @@
 
 Usage:
     streamlit run app.py
-Requires GROQ_API_KEY in .streamlit/secrets.toml (or env) for LLM answers;
+Requires GEMINI_API_KEY in .streamlit/secrets.toml (or env) for LLM answers;
 retrieval alone still works without it.
 """
 
@@ -27,15 +27,15 @@ st.sidebar.caption("RAG chatbot grounded in the book's 81 pages")
 st.sidebar.markdown(
     "- Retrieval: **all-MiniLM-L6-v2** + ChromaDB (cosine)\n"
     f"- Top-k: **{query.TOP_K}**, chunk filter: **{query.MAX_CHUNK_DISTANCE}**\n"
-    f"- LLM: **{query.PRIMARY_MODEL}** (fallback {query.FALLBACK_MODEL})"
+    f"- LLM: **{query.PRIMARY_MODEL}**"
 )
 st.sidebar.markdown("[Read the book](https://agentfactory.panaversity.org/)")
 
 API_KEY_PRESENT = bool(query.load_api_key())
 if not API_KEY_PRESENT:
     st.warning(
-        "No Groq API key found. Add it to `.streamlit/secrets.toml` "
-        "(GROQ_API_KEY = \"...\") or set the GROQ_API_KEY environment variable, "
+        "No Gemini API key found. Add it to `.streamlit/secrets.toml` "
+        "(GEMINI_API_KEY = \"...\") or set the GEMINI_API_KEY environment variable, "
         "then restart the app."
     )
 
@@ -85,12 +85,12 @@ def respond(question: str, history: list[dict]) -> tuple[str, list[tuple[str, st
     hits = query.retrieve(collection, model, q)
     if not API_KEY_PRESENT:
         return (
-            "No Groq API key is set, so I can't generate answers. Add "
-            "GROQ_API_KEY to `.streamlit/secrets.toml` and restart the app.",
+            "No Gemini API key is set, so I can't generate answers. Add "
+            "GEMINI_API_KEY to `.streamlit/secrets.toml` and restart the app.",
             build_sources(hits),
         )
     try:
-        answer = query.ask_groq(q, hits, history)
+        answer = query.ask_llm(q, hits, history)
     except RuntimeError as e:
         return f"Sorry, I couldn't answer that: {e}", build_sources(hits)
     return answer, build_sources(hits)
