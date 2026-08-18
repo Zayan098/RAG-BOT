@@ -1,13 +1,13 @@
 """Retrieve-and-answer for the book chatbot (CLI).
 
 Embeds the question with the same model/collection as ingest.py, fetches the
-top-k nearest chunks, and asks a Gemini LLM to answer per the dual-mode prompt:
+top-k nearest chunks, and asks a Groq LLM to answer per the dual-mode prompt:
 book questions are grounded in the retrieved excerpts, general questions are
 answered like a regular assistant.
 
 Usage:
     python query.py "What is a Digital FTE?"
-Set GEMINI_API_KEY (env) or fill .streamlit/secrets.toml first.
+Set GROQ_API_KEY (env) or fill .streamlit/secrets.toml first.
 """
 
 from __future__ import annotations
@@ -32,15 +32,16 @@ MAX_CHUNKS_PER_SOURCE = 2
 MAX_CHUNK_DISTANCE = 0.5  # individual chunks above this are too weak to feed the LLM
 
 QUOTA_EXHAUSTED_MSG = (
-    "The free Gemini daily quota is exhausted for today. Answers will work "
-    "again tomorrow - or add a key with more quota."
+    "The free Groq daily quota is exhausted for today. Answers will work again "
+    "tomorrow - or add a key with more quota."
 )
 
-# Gemini free tier via the official OpenAI-compatible endpoint. gemini-3.6-flash
-# is the current free-tier model (2.5-flash is retired for new users); the free
-# tier has ~1,500 requests/day (vs Groq's 250), which is why we moved to Gemini.
-PRIMARY_MODEL = "gemini-3.6-flash"
-GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
+# groq/compound-mini routes to llama-3.3-70b-versatile internally (verified via
+# its rate-limit error) and is reliable for RAG prompts. groq/compound (the
+# larger system) currently returns 413 on RAG-shaped requests, so it is the
+# fallback.
+PRIMARY_MODEL = "groq/compound-mini"
+FALLBACK_MODEL = "groq/compound"
 MAX_RETRIES = 3
 RETRY_BASE_DELAY = 5.0  # seconds; doubles per retry
 
@@ -83,23 +84,16 @@ def greeting_reply(question: str) -> str | None:
     return GREETING_MSG if GREETING_RE.match(question) else None
 
 
-def get_client():
-    from openai import OpenAI
-
-    api_key = load_api_key()
-    if not api_key:
-        raise RuntimeError("no Gemini API key found")
-    return OpenAI(api_key=api_key, base_url=GEMINI_BASE_URL)
-
-
 def reformulate(question: str, history: list[dict] | None) -> str:
     """Rewrite a follow-up question so it stands alone, using chat history."""
     if not history:
         return question
-    try:
-        client = get_client()
-    except RuntimeError:
+    api_key = load_api_key()
+    if not api_key:
         return question
+    from groq import Groq
+
+    client = Groq(api_key=api_key)
     turns = "\n".join(
         f"{m['role']}: {m['content'][:300]}" for m in history[-6:]
     )
@@ -127,14 +121,14 @@ def reformulate(question: str, history: list[dict] | None) -> str:
 
 
 def load_api_key() -> str | None:
-    key = os.environ.get("GEMINI_API_KEY")
+    key = os.environ.get("GROQ_API_KEY")
     if key and key != "your-key-here":
         return key
     secrets_path = Path(__file__).parent / ".streamlit" / "secrets.toml"
     if secrets_path.exists():
         try:
             secrets = tomllib.loads(secrets_path.read_text(encoding="utf-8"))
-            key = secrets.get("GEMINI_API_KEY", "")
+            key = secrets.get("GROQ_API_KEY", "")
             if key and key != "your-key-here":
                 return key
         except tomllib.TOMLDecodeError:
@@ -208,7 +202,7 @@ def build_messages(
 def _call_with_retry(
     client, model: str, messages: list[dict], max_tokens: int, temperature: float
 ) -> str:
-    from openai import APIStatusError, RateLimitError
+    from groq import APIStatusError, RateLimitError
 
     last_error: Exception | None = None
     for attempt in range(MAX_RETRIES):
@@ -218,17 +212,18 @@ def _call_with_retry(
                 messages=messages,
                 temperature=temperature,
                 max_tokens=max_tokens,
-                reasoning_effort="minimal",
+                tools=[],
+                tool_choice="none",
+                citation_options="disabled",
             )
-            content = response.choices[0].message.content
-            return content.strip() if content else ""
+            return response.choices[0].message.content.strip()
         except (RateLimitError, APIStatusError) as e:
             last_error = e
             message = str(e)
-            if "RESOURCE_EXHAUSTED" in message or "per day" in message:
+            if "per day" in message:
                 print(f"  ! daily quota reached on {model}: {message[:120]}")
                 raise
-            if e.status_code not in (429, 500, 503) or attempt == MAX_RETRIES - 1:
+            if e.status_code not in (413, 429) or attempt == MAX_RETRIES - 1:
                 print(f"  ! {type(e).__name__} on {model}: {message[:160]}")
                 raise
             delay = min(_retry_delay(e) * (2**attempt), 30.0)
@@ -241,23 +236,30 @@ def _call_with_retry(
     raise RuntimeError(f"all retries failed for {model}: {last_error}")
 
 
-def ask_llm(
+def ask_groq(
     question: str, hits: list[dict], history: list[dict] | None = None
 ) -> str:
-    client = get_client()
+    from groq import Groq
+
+    api_key = load_api_key()
+    if not api_key:
+        raise RuntimeError("no Groq API key found")
+    client = Groq(api_key=api_key)
     messages = build_messages(question, hits, history)
-    try:
-        return _call_with_retry(client, PRIMARY_MODEL, messages, 500, 0.2)
-    except Exception as e:
-        msg = str(e)
-        if "RESOURCE_EXHAUSTED" in msg or "per day" in msg:
-            raise RuntimeError(QUOTA_EXHAUSTED_MSG)
-        if "tokens per minute" in msg or "RATE_LIMIT" in msg:
-            raise RuntimeError(
-                "Gemini is rate-limited right now (free tier per-minute cap). "
-                "Please wait a moment and try again."
-            )
-        raise RuntimeError(f"Gemini call failed: {e}")
+    last_error: Exception | None = None
+    for model in (PRIMARY_MODEL, FALLBACK_MODEL):
+        try:
+            return _call_with_retry(client, model, messages, 500, 0.2)
+        except Exception as e:
+            last_error = e
+    if last_error and "per day" in str(last_error):
+        raise RuntimeError(QUOTA_EXHAUSTED_MSG)
+    if last_error and "tokens per minute" in str(last_error):
+        raise RuntimeError(
+            "Groq is rate-limited right now (free tier tokens-per-minute cap). "
+            "Please wait a moment and try again."
+        )
+    raise RuntimeError(f"all Groq models failed: {last_error}")
 
 
 def _retry_delay(err: Exception) -> float:
@@ -284,7 +286,7 @@ def answer(
     collection, model = retriever
     q = reformulate(question, history)
     hits = retrieve(collection, model, q)
-    return ask_llm(q, hits, history)
+    return ask_groq(q, hits, history)
 
 
 def main() -> None:
@@ -303,13 +305,13 @@ def main() -> None:
     if not api_key:
         print()
         print(
-            "No Gemini API key found (env GEMINI_API_KEY or .streamlit/secrets.toml). "
+            "No Groq API key found (env GROQ_API_KEY or .streamlit/secrets.toml). "
             "Retrieval works; set the key to get LLM answers."
         )
         sys.exit(2)
 
     try:
-        print(f"\nAnswer:\n{ask_llm(question, hits)}")
+        print(f"\nAnswer:\n{ask_groq(question, hits)}")
     except RuntimeError as e:
         print(f"\nERROR: {e}")
         sys.exit(3)

@@ -4,5 +4,5 @@ beautifulsoup4
 markdownify
 sentence-transformers
 chromadb
-openai
+groq
 langchain-text-splitters

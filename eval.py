@@ -1,7 +1,7 @@
 """Evaluation runner for the book chatbot.
 
 Reads eval_questions.md, runs each question through the pipeline, and reports
-mode correctness + answer hygiene. Use --llm to also call Gemini (costs quota);
+mode correctness + answer hygiene. Use --llm to also call Groq (costs quota);
 without it, only retrieval/greeting checks run (no API cost).
 
 Usage:
@@ -49,7 +49,7 @@ def check_hygiene(text: str) -> list[str]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run the eval question set.")
-    parser.add_argument("--llm", action="store_true", help="Call Gemini for full answers")
+    parser.add_argument("--llm", action="store_true", help="Call Groq for full answers")
     parser.add_argument("--out", type=str, default="", help="Write full answers to this file")
     args = parser.parse_args()
 
@@ -78,7 +78,7 @@ def main() -> None:
             mode = "book" if hits else "general"
             if args.llm and query.load_api_key():
                 try:
-                    answer = query.ask_llm(q, hits, history)
+                    answer = query.ask_groq(q, hits, history)
                 except RuntimeError as e:
                     answer = f"[ERROR] {e}"
             else:
